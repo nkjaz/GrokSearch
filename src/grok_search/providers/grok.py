@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import List, Optional
+from urllib.parse import urlparse
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_random_exponential
 from tenacity.wait import wait_base
 from zoneinfo import ZoneInfo
@@ -117,8 +118,17 @@ class _WaitWithRetryAfter(wait_base):
             return None
 
 
+def _url_label(url: str) -> str:
+    """用域名做链接文本——annotations 里的 title 只是引用序号（"1"），不可用"""
+    try:
+        host = urlparse(url).netloc
+    except Exception:
+        host = ""
+    return host or url
+
+
 class GrokSearchProvider(BaseSearchProvider):
-    def __init__(self, api_url: str, api_key: str, model: str = "grok-4-fast"):
+    def __init__(self, api_url: str, api_key: str, model: str = "grok-4.5"):
         super().__init__(api_url, api_key)
         self.model = model
 
@@ -136,22 +146,120 @@ class GrokSearchProvider(BaseSearchProvider):
             platform_prompt = "\n\nYou should search the web for the information you need, and focus on these platform: " + platform + "\n"
 
         time_context = get_local_time_info() + "\n"
+        user_input = time_context + query + platform_prompt
 
-        payload = {
+        await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
+
+        # 走 Responses API：只有该端点会真正触发服务端 web_search 工具。
+        # /chat/completions 会静默丢弃联网能力，模型转而凭训练记忆作答并伪造引用。
+        responses_payload = {
+            "model": self.model,
+            "stream": False,
+            "tools": [{"type": "web_search"}],
+            "instructions": search_prompt,
+            "input": user_input,
+        }
+
+        try:
+            return await self._execute_responses_with_retry(headers, responses_payload, ctx)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            # 5xx / 429 是服务端临时故障，重试已耗尽，不该掩盖成"无搜索"的降级结果
+            if status >= 500 or status == 429:
+                raise
+            await log_info(
+                ctx,
+                f"/responses 不可用 (HTTP {status})，回退 /chat/completions（该路径无联网能力）",
+                config.debug_enabled,
+            )
+
+        fallback_payload = {
             "model": self.model,
             "messages": [
                 {
                     "role": "system",
                     "content": search_prompt,
                 },
-                {"role": "user", "content": time_context + query + platform_prompt},
+                {"role": "user", "content": user_input},
             ],
             "stream": True,
         }
+        return await self._execute_stream_with_retry(headers, fallback_payload, ctx)
 
-        await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
+    async def _execute_responses_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
+        """执行带重试机制的 Responses API 请求（非流式）"""
+        # agentic 搜索会串行发起多轮 search / open_page，实测单次可达数十秒，
+        # 故读超时显著高于 /chat/completions 路径的 120s
+        timeout = httpx.Timeout(connect=6.0, read=300.0, write=10.0, pool=None)
 
-        return await self._execute_stream_with_retry(headers, payload, ctx)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(config.retry_max_attempts + 1),
+                wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
+                retry=retry_if_exception(_is_retryable_exception),
+                reraise=True,
+            ):
+                with attempt:
+                    response = await client.post(
+                        f"{self.api_url}/responses",
+                        headers=headers,
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                    return await self._parse_responses_output(response.json(), ctx)
+
+    async def _parse_responses_output(self, data: dict, ctx=None) -> str:
+        """解析 Responses API 输出：正文 + 真实访问过的来源
+
+        来源只采纳两级：
+          1. message.content[].annotations 中的 url_citation —— 正文实际引用的
+          2. web_search_call 中 open_page / find_in_page 的 url —— 实际打开读过的
+
+        action.type == "search" 的 sources[] 仅是搜索命中的候选（每次十余条），
+        未必被读取。纳入会重现"看似有据实则无据"的问题，故排除。
+        """
+        text_parts: list[str] = []
+        urls: list[str] = []
+        seen: set[str] = set()
+
+        def _add(url) -> None:
+            if isinstance(url, str) and url.startswith("http") and url not in seen:
+                seen.add(url)
+                urls.append(url)
+
+        for item in data.get("output") or []:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+
+            if item_type == "web_search_call":
+                action = item.get("action") or {}
+                if action.get("type") in ("open_page", "find_in_page"):
+                    _add(action.get("url"))
+
+            elif item_type == "message":
+                for block in item.get("content") or []:
+                    if not isinstance(block, dict) or block.get("type") != "output_text":
+                        continue
+                    if block.get("text"):
+                        text_parts.append(block["text"])
+                    for ann in block.get("annotations") or []:
+                        if isinstance(ann, dict) and ann.get("type") == "url_citation":
+                            _add(ann.get("url"))
+
+        content = "\n\n".join(text_parts).strip()
+
+        if urls:
+            # 追加 sources.py::_split_heading_sources 能识别的格式，
+            # server.py 调用 split_answer_and_sources 时会自动剥离并结构化，
+            # 因此无需改动 server.py / sources.py
+            lines = "\n".join(f"- [{_url_label(u)}]({u})" for u in urls)
+            content = f"{content}\n\nSources:\n{lines}"
+
+        await log_info(ctx, f"content: {content}", config.debug_enabled)
+
+        return content
+
 
     async def fetch(self, url: str, ctx=None) -> str:
         headers = {
