@@ -127,6 +127,17 @@ def _url_label(url: str) -> str:
     return host or url
 
 
+def _md_safe_url(url: str) -> str:
+    """转义 URL 中的圆括号后再放进 markdown 链接。
+
+    sources.py::_MD_LINK_PATTERN 用 `\\((https?://[^)]+)\\)` 匹配链接，
+    URL 自身含 ")" 时会在第一个右括号处截断（如维基百科的
+    /wiki/Claude_(AI) 会变成 /wiki/Claude_(AI，成为死链）。
+    百分号编码后语义不变，且能被该正则完整捕获。
+    """
+    return url.replace("(", "%28").replace(")", "%29")
+
+
 class GrokSearchProvider(BaseSearchProvider):
     def __init__(self, api_url: str, api_key: str, model: str = "grok-4.5"):
         super().__init__(api_url, api_key)
@@ -253,7 +264,7 @@ class GrokSearchProvider(BaseSearchProvider):
             # 追加 sources.py::_split_heading_sources 能识别的格式，
             # server.py 调用 split_answer_and_sources 时会自动剥离并结构化，
             # 因此无需改动 server.py / sources.py
-            lines = "\n".join(f"- [{_url_label(u)}]({u})" for u in urls)
+            lines = "\n".join(f"- [{_url_label(u)}]({_md_safe_url(u)})" for u in urls)
             content = f"{content}\n\nSources:\n{lines}"
 
         await log_info(ctx, f"content: {content}", config.debug_enabled)
